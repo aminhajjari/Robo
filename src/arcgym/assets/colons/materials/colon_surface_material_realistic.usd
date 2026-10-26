@@ -1,0 +1,72 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    doc = """Realistic colon surface material with improved wetness and organic appearance"""
+    upAxis = "Z"
+)
+
+def Xform "Root"
+{
+    def Material "OmniSurface"
+    {
+        token outputs:mdl:displacement.connect = </Root/OmniSurface/Shader.outputs:out>
+        token outputs:mdl:surface.connect = </Root/OmniSurface/Shader.outputs:out>
+        token outputs:mdl:volume.connect = </Root/OmniSurface/Shader.outputs:out>
+        custom uniform bool paused = 0 (
+            customData = {
+                bool nonpersistant = 1
+            }
+            hidden = true
+        )
+        token ui:displayGroup = "Material Graphs"
+        token ui:displayName = "OmniSurface"
+        int ui:order = 1024
+        uniform token[] xformOpOrder = []
+
+        def Shader "Shader"
+        {
+            uniform token info:implementationSource = "sourceAsset"
+            uniform asset info:mdl:sourceAsset = @OmniSurface.mdl@
+            uniform token info:mdl:sourceAsset:subIdentifier = "OmniSurface"
+
+            # Disable texture - use procedural color instead for more realistic appearance
+            # asset inputs:diffuse_reflection_color_image = @../textures/colon_texture_test.png@ (
+            #     colorSpace = "auto"
+            # )
+
+            # Base color - realistic colon pink/flesh tone (no texture overlay)
+            color3f inputs:diffuse_reflection_color = (0.92, 0.65, 0.60)
+
+            # Diffuse reflection weight - moderate to allow shadows/highlights
+            float inputs:diffuse_reflection_weight = 0.75
+
+            # Enable subsurface scattering for realistic tissue appearance
+            bool inputs:enable_diffuse_transmission = 1
+            float inputs:subsurface_weight = 0.3
+            color3f inputs:subsurface_color = (1.0, 0.75, 0.70)
+            float inputs:subsurface_radius = 0.01
+
+            # Specular reflection - wet mucous membrane with strong highlights
+            float inputs:specular_reflection_weight = 0.5
+            float inputs:specular_reflection_roughness = 0.15
+            color3f inputs:specular_reflection_color = (1.0, 1.0, 1.0)
+
+            # Metallic - slight for wet tissue appearance
+            float inputs:metallic_weight = 0.08
+
+            # Bump/displacement for surface irregularities (like mucosa folds)
+            float inputs:geometry_normal_strength = 0.3
+            float inputs:geometry_displacement_strength = 0.001
+
+            # UV scaling for texture detail
+            int inputs:uvw_projection_mode = 6
+            float inputs:uvw_s_scale = 10
+            float inputs:uvw_t_scale = 10
+            int inputs:uvw_texture_coordinate_system = 1
+
+            token outputs:out (
+                renderType = "material"
+            )
+        }
+    }
+}

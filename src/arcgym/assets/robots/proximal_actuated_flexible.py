@@ -1,0 +1,1201 @@
+import logging
+import math
+import torch
+import pdb
+import numpy as np
+import gymnasium as gym
+from typing import Optional
+from gymnasium.spaces import Box, Dict, Discrete
+from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf, UsdShade, PhysxSchema
+import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
+from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.sensors import CameraCfg, TiledCamera, TiledCameraCfg
+from isaaclab.sim.spawners.lights import SphereLightCfg
+from isaaclab.sensors import ContactSensorCfg, ContactSensor
+from isaaclab.utils.math import quat_apply
+from arcgym.assets.robots.base_robot import BaseRobot
+from isaaclab.actuators import ImplicitActuatorCfg
+import pdb
+
+class RobotEndoscopeChain(BaseRobot):
+    def __init__(self, scene, config, isaac_cfg, init_pos, init_rot, device, colon=None):
+        self.config = config
+        self.isaac_cfg = isaac_cfg
+        self.scene = scene
+        self.device = device
+        self.use_camera = config["env_config"].get("use_camera", False)
+        self.num_envs = scene.num_envs
+        self.colon = colon  # Reference to ColonModel for stress calculation
+
+        logging.info(f"Initializing Continuum Snake Robot at pos: {init_pos}")
+
+        # Initial pose
+        self.init_pos = torch.tensor(init_pos, device=device, dtype=torch.float32)
+        self.init_rot = torch.tensor(init_rot, device=device, dtype=torch.float32)  # (w, x, y, z)
+        self.env_init_pos = None
+        
+        # Track initialization state
+        self._is_initialized = False
+
+        # Build robot USD and create articulation config (but don't instantiate yet)
+        self._build_robot()
+
+        # Sensors
+        if self.use_camera:
+            logging.info("Creating egocentric camera...")
+            self.egocamera = TiledCamera(self.isaac_cfg.camera_cfg)
+            self.scene.sensors['egocamera'] = self.egocamera
+            logging.info("Camera created")
+
+        logging.info("Creating front light...")
+        # Attach light to passive_0 at the camera position (+X end)
+        light_paths = "/World/envs/env_.*/Robot/passive_0/front_light"
+        link_height = self.config["robot_config"].get("link_height", 0.05)
+        self.egolight = sim_utils.spawn_light(
+            prim_path=light_paths,
+            cfg=self.isaac_cfg.light_cfg,
+            translation=(link_height, 0.0, 0.0)  # Same position as camera at +X end
+        )
+        logging.info("Light created")
+
+
+        # Register - The scene will call spawn() on the articulation during its setup
+        self.scene.articulations['robot'] = self.robot
+        logging.info("Continuum robot registered with scene")
+
+    def _build_robot(self):
+        """Build multi-segment continuum robot with 20 passive links and proximal actuation.
+
+        Structure: world_anchor → (prismatic X) → passive_19 → ... → passive_0 (tip)
+        - Translational motion (forward/back) is applied via prismatic joint at proximal end
+        - Y/Z motion, pitch/yaw, and roll are applied via anchor velocity
+
+        This structure uses 20 joints total (19 revolute + 1 prismatic), matching magnetic_endoscope.py
+        for CSV state compatibility.
+        """
+        robot_config = self.config["robot_config"]
+        PASSIVE_COLOR = Gf.Vec3f(0.5, 0.5, 0.5)  # Grey
+        BASE_COLOR    = Gf.Vec3f(0.8, 0.2, 0.2)  # Red (unused now but kept)
+        ACTIVE_COLOR  = Gf.Vec3f(0.2, 0.8, 0.2)  # Green (unused now but kept)
+
+        # Original config values (kept for compatibility, but overridden)
+        num_passive_cfg = robot_config.get("num_passive_segments", robot_config.get("num_passive_links", 20))
+        num_active_cfg = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
+
+        # === Enforce: 20 links total, all passive, proximal link actuated ===
+        num_links_total = robot_config.get("num_links_total", 20)
+        num_passive = num_links_total
+        num_active = 0  # no active section anymore
+
+        logging.info(f"Building robot with TOTAL_LINKS={num_links_total} (num_passive={num_passive}, num_active={num_active})")
+
+        link_radius = robot_config.get("link_radius", 0.01)
+        link_height = robot_config.get("link_height", 0.05)
+        passive_stiffness = robot_config.get("passive_stiffness", 1e2)
+        passive_damping = robot_config.get("passive_damping", 1e3)
+
+        # 20 links -> 19 revolute joints in the chain (passive_1_joint to passive_19_joint)
+        # Plus 1 prismatic joint at proximal end = 20 total joints (matching magnetic_endoscope.py)
+        num_revolute_joints = num_passive - 1  # 19 revolute joints connecting the links
+        self.num_joints = num_passive  # Total joints: 19 revolute + 1 prismatic = 20
+        self.active_joint_indices = []  # all joints passive; no actively-driven section
+        self.prismatic_joint_index = num_revolute_joints  # The prismatic joint index (19)
+
+        logging.info(f"Total joints: {self.num_joints} (19 revolute + 1 prismatic)")
+        logging.info(f"Active joint indices: {self.active_joint_indices}, count: {len(self.active_joint_indices)}")
+        logging.info(f"Prismatic joint index: {self.prismatic_joint_index}")
+
+        # Articulation root at world_anchor (fixed base)
+        prim_paths = f"/World/envs/env_.*/Robot/world_anchor"
+
+        # === Define Actuators ===
+        actuators = {}
+
+        # Passive joints with PD actuators
+        # passive_0 is the root (no joint)
+        # passive_1 onwards connect via revolute joints (passive_1_joint, passive_2_joint, ...)
+        for i in range(1, num_passive):
+            joint_name = f"passive_{i}_joint"
+            actuators[joint_name] = ImplicitActuatorCfg(
+                joint_names_expr=[f".*{joint_name}"],
+                effort_limit=100,
+                velocity_limit=1.0,
+                stiffness=passive_stiffness,
+                damping=passive_damping,
+            )
+
+        # Prismatic joint actuator (for translation along X at proximal end)
+        # Use low stiffness and high damping for velocity control
+        actuators["proximal_prismatic_joint"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*proximal_prismatic_joint"],
+            effort_limit=1e4,
+            velocity_limit=10.0,
+            stiffness=0.0,  # No position stiffness for velocity control
+            damping=1e4,    # High damping to respond to velocity targets
+        )
+
+        # No base_joint, no active joints anymore
+        # (All links passively follow the proximal end via revolute joints with PD actuators)
+
+        # === Build USD ===
+        stage = self.scene.stage
+
+        # Build USD for each environment
+        for env_id in range(self.num_envs):
+            env_path = f"/World/envs/env_{env_id}/Robot"
+
+            # Build chain: world_anchor (fixed root) → (prismatic X) → proximal_base → (twist X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
+            # The articulation root is the world_anchor at the proximal position
+            # Translation and twist are applied at the proximal end (passive_19 side)
+
+            # Create a fixed world anchor at the proximal position as the articulation root
+            world_anchor_path = f"{env_path}/world_anchor"
+            # Position at proximal end (passive_19 position, which is at x ≈ -(num_passive - 0.5) * link_height)
+            proximal_x = -(num_passive - 0.5) * link_height
+            world_anchor_pos = Gf.Vec3f(proximal_x - link_height / 2, 0.0, link_radius)  # Just behind proximal link
+            # Create a very small fixed link as anchor
+            anchor = UsdGeom.Sphere.Define(stage, world_anchor_path)
+            anchor.CreateRadiusAttr().Set(0.001)  # Very small
+            anchor.AddTranslateOp().Set(world_anchor_pos)
+            anchor_prim = anchor.GetPrim()
+
+            # Make it the articulation root
+            UsdPhysics.ArticulationRootAPI.Apply(anchor_prim)
+            UsdPhysics.RigidBodyAPI.Apply(anchor_prim)
+
+            # Fix it in place by making it kinematically controlled (no dynamics)
+            physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(anchor_prim)
+            physx_rigid_body_api.CreateDisableGravityAttr().Set(True)
+            # Set very high mass to make it effectively immovable
+            mass_api = UsdPhysics.MassAPI.Apply(anchor_prim)
+            mass_api.CreateMassAttr().Set(1e10)  # Extremely heavy to stay fixed
+
+            # Disable collisions for the anchor
+            anchor_prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
+
+            # Index of proximal link (passive_19)
+            proximal_link_idx = num_passive - 1
+
+            prev_link_path = None
+
+            for i in range(num_passive):
+                link_name = f"passive_{i}"
+                link_path = f"{env_path}/{link_name}"
+                # Generate robot along -X direction: passive_0 at x≈0, passive_1 at x≈-a, passive_2 at x≈-2a, etc.
+                pos = Gf.Vec3f(-(i + 0.5) * link_height, 0.0, link_radius)
+                self._create_link(stage, link_path, link_radius, link_height, pos, color=PASSIVE_COLOR)
+
+                if i >= 1:
+                    # passive_1 onwards: revolute joints connecting to previous link
+                    # Connect at -X end of previous link to +X end of current link
+                    axis = "Z" if i % 2 == 1 else "Y"
+                    self._create_revolute_joint(
+                        stage=stage,
+                        joint_name=f"{link_name}_joint",
+                        body0_path=prev_link_path,
+                        body1_path=link_path,
+                        local_pos0=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of previous link
+                        local_pos1=Gf.Vec3f(link_height / 2, 0, 0),   # +X end of current link
+                        axis=axis,
+                        stiffness=passive_stiffness,
+                        damping=passive_damping,
+                        target_pos=0.0
+                    )
+
+                prev_link_path = link_path
+
+            # Create prismatic joint connecting world_anchor to passive_19 (proximal link)
+            # This allows translation along X-axis (forward/back) at the proximal end
+            proximal_link_path = f"{env_path}/passive_{proximal_link_idx}"
+            self._create_prismatic_joint(
+                stage=stage,
+                joint_name="proximal_prismatic_joint",
+                body0_path=world_anchor_path,
+                body1_path=proximal_link_path,
+                local_pos0=Gf.Vec3f(0, 0, 0),  # Center of anchor
+                local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of proximal link (passive_19)
+                axis="X",  # Allow sliding along X-axis (forward/back)
+                stiffness=0.0,   # No position stiffness for velocity control
+                damping=1e4,     # High damping to respond to velocity targets
+                target_pos=0.0
+            )
+
+            # --- Structure ---
+            # world_anchor (root, fixed) → (prismatic X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
+
+            # --- Create a hollow tube around the robot for this env ---
+            # tube_path = f"{env_path}/Tube"
+            # tube_pos = Gf.Vec3f(0.2882,  0.2539, 0.0)  # tweak so tube encloses the robot
+            # inner_r = link_radius + 0.009
+            # thickness = 0.003
+            # length = (num_passive + 15) * link_height  # span whole robot
+            # self._create_hollow_tube(stage, tube_path,
+            #                          inner_radius=inner_r,
+            #                          thickness=thickness,
+            #                          length=length,
+            #                          axis="Z",
+            #                          resolution=48,
+            #                          segments_along=16,
+            #                          position=tube_pos,
+            #                          color=Gf.Vec3f(0.9, 0.9, 0.9),
+            #                          static=True)
+
+            # Diagnostic: list children under this environment to help detect missing prims
+            try:
+                env_parent_path = f"/World/envs/env_{env_id}"
+                env_parent_prim = stage.GetPrimAtPath(env_parent_path)
+                if env_parent_prim:
+                    children = env_parent_prim.GetChildren()
+                    logging.info(f"Env {env_id} children: {[c.GetName() for c in children]}")
+                else:
+                    logging.warning(f"Env parent prim not found at {env_parent_path}")
+            except Exception as e:
+                logging.warning(f"Failed listing children for env {env_id}: {e}")
+
+        # === ArticulationCfg ===
+        articulation_cfg = ArticulationCfg(
+            prim_path=prim_paths,
+            spawn=None,  # USD already created above
+            init_state=ArticulationCfg.InitialStateCfg(
+                pos=(0.0, 0.0, 0.0),
+                rot=(1.0, 0.0, 0.0, 0.0),
+                joint_pos={".*": 0.0},
+            ),
+            actuators=actuators,
+        )
+
+        # Create the Articulation object
+        self.robot = Articulation(articulation_cfg)
+
+        logging.info(f"Articulation created with {len(actuators)} actuator groups")
+
+    def _create_link(self, stage, path, radius, height, position, color: Gf.Vec3f):
+        cyl = UsdGeom.Capsule.Define(stage, path)
+        cyl.CreateRadiusAttr().Set(radius)
+        cyl.CreateHeightAttr().Set(height)
+        cyl.CreateAxisAttr().Set("X")
+        cyl.AddTranslateOp().Set(position)
+        cyl.AddRotateXYZOp().Set(Gf.Vec3f(0, 0, 0))
+
+        prim = cyl.GetPrim()
+        primvars_api = UsdGeom.PrimvarsAPI(prim)
+        primvars_api.CreatePrimvar("displayColor", 
+                                 Sdf.ValueTypeNames.Color3fArray, 
+                                 UsdGeom.Tokens.constant).Set([color])
+        
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+        UsdPhysics.CollisionAPI.Apply(prim)
+        mass_api = UsdPhysics.MassAPI.Apply(prim)
+        #mass_api.CreateDensityAttr().Set(1000.0)
+        mass_api.CreateMassAttr().Set(200)
+
+        # Disable gravity for this rigid body
+        physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
+
+        # Enable contact reporting
+        prim.SetCustomData({"physxContactReport:enabled": True})
+
+    def _create_revolute_joint(self, stage, joint_name, body0_path, body1_path,
+                               local_pos0, local_pos1, axis, stiffness, damping, target_pos):
+        joint_path = f"{body0_path}/{joint_name}"
+        joint = UsdPhysics.RevoluteJoint.Define(stage, joint_path)
+        joint.CreateBody0Rel().SetTargets([body0_path])
+        joint.CreateBody1Rel().SetTargets([body1_path])
+        joint.CreateAxisAttr().Set(axis)
+        joint.CreateLocalPos0Attr().Set(local_pos0)
+        joint.CreateLocalPos1Attr().Set(local_pos1)
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+
+        # Set joint limits to prevent excessive bending
+        # Limit to ±30 degrees (±0.524 radians)
+        joint.CreateLowerLimitAttr().Set(-30.0)  # degrees
+        joint.CreateUpperLimitAttr().Set(30.0)   # degrees
+
+        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
+        drive.CreateTypeAttr().Set("position")
+        drive.CreateTargetPositionAttr().Set(target_pos)
+        drive.CreateStiffnessAttr().Set(stiffness)
+        drive.CreateDampingAttr().Set(damping)
+        drive.CreateMaxForceAttr().Set(1e1)
+
+    def _create_prismatic_joint(self, stage, joint_name, body0_path, body1_path,
+                                local_pos0, local_pos1, axis, stiffness, damping, target_pos):
+        """Create a prismatic (sliding) joint along specified axis.
+
+        If body1_path is None or empty, the joint connects to the world (fixed frame).
+        """
+        joint_path = f"{body0_path}/{joint_name}"
+        joint = UsdPhysics.PrismaticJoint.Define(stage, joint_path)
+        joint.CreateBody0Rel().SetTargets([body0_path])
+
+        # Only set body1 if a path is provided (otherwise it connects to world)
+        if body1_path:
+            joint.CreateBody1Rel().SetTargets([body1_path])
+
+        joint.CreateAxisAttr().Set(axis)
+        joint.CreateLocalPos0Attr().Set(local_pos0)
+        joint.CreateLocalPos1Attr().Set(local_pos1)
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+
+        # Set joint limits (allowing movement along the axis)
+        joint.CreateLowerLimitAttr().Set(-1.0)  # meters
+        joint.CreateUpperLimitAttr().Set(1.0)   # meters
+
+        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "linear")
+        drive.CreateTypeAttr().Set("force")
+        drive.CreateTargetPositionAttr().Set(target_pos)
+        drive.CreateTargetVelocityAttr().Set(0.0)  # Add velocity target attribute
+        drive.CreateStiffnessAttr().Set(stiffness)
+        drive.CreateDampingAttr().Set(damping)
+        drive.CreateMaxForceAttr().Set(1e4)
+
+        return joint
+
+    def _create_d6_joint(self, stage, joint_name, body0_path, body1_path,
+                        local_pos0, local_pos1):
+        """
+        Create a PhysX D6-like free joint using UsdPhysics.Joint + PhysxJointAPI
+        compatible with IsaacLab (no CreateMotionXXXRel helpers).
+        Distal link is fully free relative to previous link.
+        """
+
+        joint_path = f"{body0_path}/{joint_name}"
+
+        # 1. Generic USD joint prim
+        joint = UsdPhysics.Joint.Define(stage, joint_path)
+        prim = joint.GetPrim()
+
+        # 2. Attach PhysX joint API
+        physx_joint = PhysxSchema.PhysxJointAPI.Apply(prim)
+
+        # 3. Attach bodies
+        joint.CreateBody0Rel().SetTargets([body0_path])
+        joint.CreateBody1Rel().SetTargets([body1_path])
+
+        # 4. Local frames
+        joint.CreateLocalPos0Attr().Set(local_pos0)
+        joint.CreateLocalPos1Attr().Set(local_pos1)
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+
+        # 5. Set all 6 motions to "free"
+        # Linear DOF: X Y Z
+        prim.CreateAttribute("physics:linear:motionX", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:linear:motionY", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:linear:motionZ", Sdf.ValueTypeNames.Token).Set("free")
+
+        # Angular DOF: X, Y, Z
+        prim.CreateAttribute("physics:angular:motionX", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:angular:motionY", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:angular:motionZ", Sdf.ValueTypeNames.Token).Set("free")
+
+        return prim
+
+
+# ----------------------- paste below _create_revolute_joint -----------------------
+    def _create_hollow_tube(self, stage, path, inner_radius=0.02, thickness=0.002,
+                            length=1.0, axis="X", resolution=64, segments_along=8,
+                            position=Gf.Vec3f(0.0, 0.0, 0.0), color=Gf.Vec3f(0.9,0.9,0.9),
+                            static=True):
+        """
+        Create a hollow tube as a triangulated mesh and attach physics collision/rigid body.
+        - path: prim path under stage (e.g., "/World/envs/env_0/Tube")
+        - inner_radius: inner radius (meters)
+        - thickness: shell thickness (meters)
+        - length: tube length along chosen axis (meters)
+        - axis: 'X'|'Y'|'Z' - axis the tube runs along (defaults to X to match robot)
+        - resolution: number of vertices around circumference
+        - segments_along: subdivisions along tube length (increases mesh smoothness)
+        - position: translate the tube (Gf.Vec3f)
+        - color: display color
+        - static: if True the rigid body is static (non-moving)
+        """
+        from pxr import UsdGeom, Usd, Sdf, Gf, UsdPhysics
+
+        outer_r = inner_radius + thickness
+        # Build points: (segments_along+1) slices along length, each with resolution points for outer and inner
+        points = []
+        uvs = []  # optional
+        faceVertexCounts = []
+        faceVertexIndices = []
+
+        # param along axis
+        for seg in range(segments_along + 1):
+            t = seg / float(segments_along)
+            # x position along length centered at 0
+            coord = (t - 0.5) * length
+            for ring in (outer_r, inner_radius):
+                for i in range(resolution):
+                    theta = 2.0 * math.pi * i / resolution
+                    y = math.cos(theta) * ring
+                    z = math.sin(theta) * ring
+                    if axis == "X":
+                        p = (coord, y, z)
+                    elif axis == "Y":
+                        p = (y, coord, z)
+                    else:
+                        p = (y, z, coord)
+                    points.append(Gf.Vec3f(*p))
+
+        # Build faces: connect quads between successive segments, outer then inner (but we must maintain consistent winding)
+        # Vertex indexing scheme:
+        # slice_index * (2*resolution) + (ring_idx * resolution) + i
+        def vid(slice_idx, ring_idx, i):
+            return slice_idx * (2 * resolution) + (ring_idx * resolution) + i
+
+        for s in range(segments_along):
+            # connect outer shell (ring 0)
+            for i in range(resolution):
+                i_next = (i + 1) % resolution
+                # Quad on outer: v0, v1, v2, v3  (we'll triangulate to two triangles)
+                v0 = vid(s, 0, i)
+                v1 = vid(s+1, 0, i)
+                v2 = vid(s+1, 0, i_next)
+                v3 = vid(s, 0, i_next)
+                # triangle 1
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([v0, v1, v2])
+                # triangle 2
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([v0, v2, v3])
+
+            # connect inner shell (ring 1) - note winding reversed to make interior face normals point inward
+            for i in range(resolution):
+                i_next = (i + 1) % resolution
+                v0 = vid(s, 1, i)
+                v1 = vid(s, 1, i_next)
+                v2 = vid(s+1, 1, i_next)
+                v3 = vid(s+1, 1, i)
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([v0, v1, v2])
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([v0, v2, v3])
+
+            # connect between outer and inner at ends to close shell thickness (create quads between outer/inner edges)
+            for ring_end in (0, 1):
+                # we create faces on the side (thin face) by connecting outer->inner at this slice to close thickness
+                # For each i, connect outer(i) -> outer(i_next) -> inner(i_next) -> inner(i)
+                # We'll do this per slice (s and s+1 will be handled by their own loops). Handle slice s here to generate thin faces along circumference.
+                pass
+        # The above creates the longitudinal shell faces; we also need radial faces closing thickness along circumference (between outer and inner)
+        # We'll now add faces for each slice to connect outer->inner (closing shell thickness along circumference)
+        for s in range(segments_along + 1):
+            for i in range(resolution):
+                i_next = (i + 1) % resolution
+                outer_i = vid(s, 0, i)
+                outer_next = vid(s, 0, i_next)
+                inner_i = vid(s, 1, i)
+                inner_next = vid(s, 1, i_next)
+                # create two triangles for quad (outer_i, outer_next, inner_next, inner_i)
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([outer_i, outer_next, inner_next])
+                faceVertexCounts.append(3)
+                faceVertexIndices.extend([outer_i, inner_next, inner_i])
+
+        # Define mesh prim
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.CreatePointsAttr().Set(points)
+        mesh.CreateFaceVertexCountsAttr().Set(faceVertexCounts)
+        mesh.CreateFaceVertexIndicesAttr().Set(faceVertexIndices)
+        # Optionally set normals/uvs; USD can compute normals if needed
+        mesh.AddTranslateOp().Set(position)
+        # visual color
+        prim = mesh.GetPrim()
+        primvars_api = UsdGeom.PrimvarsAPI(prim)
+        primvars_api.CreatePrimvar("displayColor",
+                                  Sdf.ValueTypeNames.Color3fArray,
+                                  UsdGeom.Tokens.constant).Set([color])
+        prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(True)
+        # Physics: make static rigid body
+        if static:
+            # Static collision object
+            UsdPhysics.CollisionAPI.Apply(prim)
+
+            # PhysX: enable triangle mesh collision (needed for hollow geometry)
+            from pxr import PhysxSchema
+
+            physx = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+            
+
+
+
+        return mesh
+
+    @staticmethod
+    def make_isaac_config(config: dict):
+        env_config = config["env_config"]
+        robot_config = config["robot_config"]
+        simulation_config = config["simulation_config"]
+        discrete_action_space = env_config.get("discrete_action_space", False)
+        camera_update_period = simulation_config["render_interval"] * simulation_config["dt"]
+        camera_height, camera_width = robot_config["camera_resolution"]
+
+        num_active_segments = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
+        link_height = robot_config.get("link_height", 0.5)
+        # Camera attached to passive_0 (the free-floating tip with D6 joint)
+        CAMERA_CFG = TiledCameraCfg(
+            prim_path="/World/envs/env_.*/Robot/passive_0/front_cam",
+            update_period=camera_update_period,
+            height=camera_height,
+            width=camera_width,
+            data_types=["rgb", "depth"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=robot_config["front_camera_focal_length"],
+                focus_distance=robot_config["front_camera_focus_distance"],
+                horizontal_aperture=robot_config["front_camera_horizontal_aperture"],
+                clipping_range=robot_config["front_camera_clipping_range"],
+            ),
+            offset=TiledCameraCfg.OffsetCfg(
+                # Put camera directly in front of the capsule tip
+                pos=(link_height, 0.0, 0.0),
+
+                # Rotate camera 90° around Y-axis so it looks along +X axis, then 180° around X-axis (upside down)
+                rot=(-0.5, 0.5, 0.5, -0.5),
+
+                # Offset is relative to passive_0 frame
+                convention="local"
+            ),
+        )
+
+
+        LIGHT_CFG = SphereLightCfg(
+            color=robot_config["front_light_color"],
+            color_temperature=robot_config["front_light_color_temperature"],
+            intensity=robot_config["front_light_intensity"],
+            radius=robot_config["front_light_radius"],
+            exposure=robot_config["front_light_exposure"],
+            visible=True,
+        )
+
+        class RobotContinuumSnakeCfg:
+            camera_cfg = CAMERA_CFG
+            light_cfg = LIGHT_CFG
+            action_space = Discrete(6) if discrete_action_space else Box(low=-1.0, high=1.0, shape=(6,))
+            observation_space = Dict({"rgb": Box(0, 255, shape=(3, camera_height, camera_width), dtype=np.uint8)})
+
+        return RobotContinuumSnakeCfg()
+
+    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0, **kwargs) -> None:
+        """
+        Apply per-step local tip-frame displacement and angle increments.
+
+        Actions (per env):
+            [0] delta_left_right   (m along local tip +Y, -Y)
+            [1] delta_up_down      (m along local tip +Z, -Z)
+            [2] delta_forward_back (m along local tip +X, -X)
+            [3] delta_roll         (rad around local tip +X, -X)
+            [4] delta_yaw          (rad around local tip +Z, -Z)
+            [5] delta_pitch        (rad around local tip +Y, -Y)
+
+        Args:
+            actions: Action tensor of shape (num_envs, 6). Movement constraints should be
+                    applied BEFORE calling this method (in environment's _apply_movement_constraints).
+            action_scale: Scaling factor for actions
+            **kwargs: Additional parameters for compatibility (e.g., center_alignment passed from env)
+
+        Structure: world_anchor (root) → (prismatic X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
+        All commands are interpreted in the current distal tip frame and applied as a root pose increment.
+        """
+        if not self._is_initialized:
+            logging.warning("Cannot apply action - robot not initialized yet")
+            return
+
+        # Scale actions
+        actions = actions * action_scale
+
+        delta_lr = actions[:, 0]
+        delta_ud = actions[:, 1]
+        delta_fb = actions[:, 2]
+        delta_roll = actions[:, 3]
+        delta_yaw = actions[:, 4]
+        delta_pitch = -actions[:, 5]
+
+        current_root_state = self.robot.data.root_state_w.clone()
+        root_pos = current_root_state[:, :3]
+        root_quat = current_root_state[:, 3:7]
+
+        # Get body states - shape: (num_envs, num_bodies, 13)
+        # where 13 = pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
+        body_state = self.robot.data.body_state_w
+
+        # Find the correct body indices by name
+        # The body order in IsaacLab may not match creation order
+        body_names = self.robot.body_names
+
+        # Debug: print body names on first call
+        if not hasattr(self, '_body_names_printed'):
+            logging.info(f"Robot body names: {body_names}")
+            self._body_names_printed = True
+
+        # Find distal tip (passive_0) index and cache it.
+        if not hasattr(self, '_distal_body_idx'):
+            self._distal_body_idx = None
+
+            for i, name in enumerate(body_names):
+                if name.endswith("passive_0") or "/passive_0" in name:
+                    self._distal_body_idx = i
+
+            logging.info(f"Body index lookup - distal (passive_0): {self._distal_body_idx}")
+
+        # Get orientations from body states
+        try:
+            if self._distal_body_idx is not None:
+                distal_quat = body_state[:, self._distal_body_idx, 3:7]  # (num_envs, 4)
+            else:
+                logging.warning("Distal body index not found, using root_quat")
+                distal_quat = root_quat
+        except (IndexError, RuntimeError) as e:
+            # Fallback to root orientation if body states not available
+            logging.warning(f"Error getting body states: {e}, using root_quat")
+            distal_quat = root_quat
+
+        local_translation = torch.stack([delta_fb, delta_lr, delta_ud], dim=1)
+        world_translation = quat_apply(distal_quat, local_translation)
+
+        local_rotvec = torch.stack([delta_roll, delta_pitch, delta_yaw], dim=1)
+        world_rotvec = quat_apply(distal_quat, local_rotvec)
+        world_angle = torch.linalg.norm(world_rotvec, dim=1)
+        fallback_axis = torch.zeros_like(world_rotvec)
+        fallback_axis[:, 0] = 1.0
+        safe_axis = torch.where(
+            world_angle.unsqueeze(1) > 1e-8,
+            world_rotvec / world_angle.unsqueeze(1),
+            fallback_axis,
+        )
+        delta_world_quat = math_utils.quat_from_angle_axis(world_angle, safe_axis)
+
+        new_root_state = current_root_state.clone()
+        new_root_state[:, :3] = root_pos + world_translation
+        new_root_state[:, 3:7] = math_utils.quat_mul(delta_world_quat, root_quat)
+        new_root_state[:, 7:13] = 0.0
+        self.robot.write_root_state_to_sim(new_root_state)
+
+
+    def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:
+        use_camera = use_camera if use_camera is not None else self.use_camera
+        obs = {}
+
+        # Only include joint_pos if there are active joints
+        if len(self.active_joint_indices) > 0:
+            if self._is_initialized:
+                active_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
+                obs["joint_pos"] = active_pos
+            else:
+                obs["joint_pos"] = torch.zeros((self.num_envs, len(self.active_joint_indices)), device=self.device)
+
+        if use_camera and hasattr(self, 'egocamera'):
+            if hasattr(self.egocamera.data, 'output') and "rgb" in self.egocamera.data.output:
+                rgb = self.egocamera.data.output["rgb"]
+                obs["rgb"] = rgb.permute(0, 3, 1, 2)
+
+        return obs
+
+    def get_pose(self):
+        """Get robot root state. Returns zeros if not yet initialized."""
+        if not self._is_initialized:
+            return torch.zeros((self.num_envs, 13), device=self.device)
+        
+        try:
+            root_state = self.robot.data.root_state_w
+            if torch.isnan(root_state).any():
+                logging.error("Robot root state contains NaN values!")
+                return torch.zeros((self.num_envs, 13), device=self.device)
+            return root_state
+        except (AttributeError, RuntimeError) as e:
+            logging.warning(f"Robot data not yet available: {e}")
+            return torch.zeros((self.num_envs, 13), device=self.device)
+
+    def get_depth(self):
+        if not hasattr(self.egocamera.data, 'output') or "depth" not in self.egocamera.data.output:
+            raise ValueError("Depth data not available")
+        return self.egocamera.data.output["depth"]
+
+    def set_pos(self, init_pos, init_rot=None):
+        if isinstance(init_pos, torch.Tensor):
+            self.env_init_pos = init_pos.clone()
+        else:
+            self.init_pos = torch.tensor(init_pos, device=self.device)
+            self.env_init_pos = self.init_pos.clone().unsqueeze(0)
+
+        if init_rot is not None:
+            self.init_rot = torch.tensor(init_rot, device=self.device)
+
+    def _load_state_from_csv(self, csv_filepath: str, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load robot state (root pose and joint positions) from a CSV file saved during teleoperation.
+
+        Args:
+            csv_filepath: Path to the CSV file (e.g., "saved_states/c1t1_start.csv")
+            env_ids: Environment indices to load data for. Each env_id will load its corresponding
+                    row from the CSV file (matching the env_id column).
+
+        Returns:
+            Tuple of (root_pos, root_quat, joint_positions):
+                - root_pos: Root position tensor. Shape: (len(env_ids), 3)
+                - root_quat: Root quaternion (w,x,y,z). Shape: (len(env_ids), 4)
+                - joint_positions: Joint positions tensor. Shape: (len(env_ids), num_joints)
+        """
+        import pandas as pd
+        import os
+
+        if not os.path.exists(csv_filepath):
+            raise FileNotFoundError(f"CSV file not found: {csv_filepath}")
+
+        # Load the CSV
+        df = pd.read_csv(csv_filepath)
+
+        # Convert env_ids to list for indexing
+        env_ids_list = env_ids.cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
+
+        # Extract joint columns once
+        joint_cols = [col for col in df.columns if col.startswith('joint_') and col.endswith('_pos')]
+        joint_cols = sorted(joint_cols, key=lambda x: int(x.split('_')[1]))  # Sort by joint number
+
+        # Prepare batch tensors
+        root_pos_list = []
+        root_quat_list = []
+        joint_pos_list = []
+
+        # If this is an entry CSV (start/strat), use env_0 as the reference
+        # and translate the root pose for the rest of the environments.
+        basename = os.path.basename(csv_filepath).lower()
+        use_env0_reference = basename.endswith("start.csv") or basename.endswith("strat.csv")
+
+        # Compute translations relative to env_0 if needed
+        if use_env0_reference:
+            env_ids_tensor = torch.tensor(env_ids_list, device=self.device, dtype=torch.long)
+            translations = None
+            if getattr(self, "colon", None) is not None and hasattr(self.colon, "env_translation"):
+                translations = self.colon.env_translation
+            elif hasattr(self.scene, "env_origins") and self.scene.env_origins is not None:
+                translations = self.scene.env_origins - self.scene.env_origins[0]
+
+            if translations is None:
+                translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+            else:
+                translations = translations.to(self.device)
+                if translations.shape[0] <= env_ids_tensor.max().item():
+                    translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+                else:
+                    translations = translations[env_ids_tensor]
+                if not torch.isfinite(translations).all():
+                    logging.warning("Non-finite env translations detected; falling back to zeros.")
+                    translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+
+            # Load env_0 as the base configuration
+            if 0 not in df['env_id'].values:
+                raise ValueError(f"env_id 0 not found in CSV file: {csv_filepath}")
+
+            env0_row = df[df['env_id'] == 0].iloc[0]
+            base_root_pos = torch.tensor(
+                [env0_row['root_pos_x'], env0_row['root_pos_y'], env0_row['root_pos_z']],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            base_root_quat = torch.tensor(
+                [env0_row['root_quat_w'], env0_row['root_quat_x'], env0_row['root_quat_y'], env0_row['root_quat_z']],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            base_joint_positions = [env0_row[col] for col in joint_cols]
+
+            # Handle mismatch between CSV joints and robot joints
+            if len(base_joint_positions) != self.robot.num_joints:
+                if len(base_joint_positions) > self.robot.num_joints:
+                    base_joint_positions = base_joint_positions[:self.robot.num_joints]
+                else:
+                    base_joint_positions.extend([0.0] * (self.robot.num_joints - len(base_joint_positions)))
+
+            for idx in range(len(env_ids_list)):
+                root_pos_list.append((base_root_pos + translations[idx]).tolist())
+                root_quat_list.append(base_root_quat.tolist())
+                joint_pos_list.append(list(base_joint_positions))
+
+            root_pos_batch = torch.tensor(root_pos_list, dtype=torch.float32, device=self.device)
+            root_quat_batch = torch.tensor(root_quat_list, dtype=torch.float32, device=self.device)
+            joint_pos_batch = torch.tensor(joint_pos_list, dtype=torch.float32, device=self.device)
+
+            root_pos_batch = torch.nan_to_num(root_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            root_quat_batch = torch.nan_to_num(root_quat_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            joint_pos_batch = torch.nan_to_num(joint_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
+            logging.info(
+                f"Loaded env_0 state from {csv_filepath} and translated to {len(env_ids_list)} environments"
+            )
+            return root_pos_batch, root_quat_batch, joint_pos_batch
+
+        for env_id in env_ids_list:
+            # Get the row for this environment
+            if env_id not in df['env_id'].values:
+                logging.warning(f"Environment {env_id} not found in CSV file. Using env_id=0 as fallback.")
+                env_id = 0
+
+            row = df[df['env_id'] == env_id].iloc[0]
+
+            # Extract root position (x, y, z)
+            root_pos = [row['root_pos_x'], row['root_pos_y'], row['root_pos_z']]
+            root_pos_list.append(root_pos)
+
+            # Extract root quaternion (w, x, y, z)
+            root_quat = [row['root_quat_w'], row['root_quat_x'], row['root_quat_y'], row['root_quat_z']]
+            root_quat_list.append(root_quat)
+
+            # Extract joint positions
+            joint_positions = [row[col] for col in joint_cols]
+
+            # Handle mismatch between CSV joints and robot joints
+            if len(joint_positions) != self.robot.num_joints:
+                # If CSV has more joints than robot, truncate to robot's joint count
+                if len(joint_positions) > self.robot.num_joints:
+                    joint_positions = joint_positions[:self.robot.num_joints]
+                # If CSV has fewer joints than robot, pad with zeros
+                else:
+                    joint_positions.extend([0.0] * (self.robot.num_joints - len(joint_positions)))
+
+            joint_pos_list.append(joint_positions)
+
+        # Convert to tensors
+        root_pos_batch = torch.tensor(root_pos_list, dtype=torch.float32, device=self.device)
+        root_quat_batch = torch.tensor(root_quat_list, dtype=torch.float32, device=self.device)
+        joint_pos_batch = torch.tensor(joint_pos_list, dtype=torch.float32, device=self.device)
+
+        root_pos_batch = torch.nan_to_num(root_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+        root_quat_batch = torch.nan_to_num(root_quat_batch, nan=0.0, posinf=0.0, neginf=0.0)
+        joint_pos_batch = torch.nan_to_num(joint_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
+        logging.info(f"Loaded robot state from {csv_filepath} for {len(env_ids_list)} environments")
+        return root_pos_batch, root_quat_batch, joint_pos_batch
+
+    def generate_random_joint_positions(
+        self,
+        num_configs: int = None,
+        max_angle: float = 0.5,
+        smoothness: float = 0.8,
+        ) -> torch.Tensor:
+        """Generate reasonable random joint configurations for the robot.
+
+        Creates smooth, physically plausible joint configurations by using adjacent
+        joint correlation to avoid sharp bends.
+
+        Args:
+            num_configs: Number of configurations to generate. If None, generates for all envs.
+            max_angle: Maximum joint angle in radians. Default: 0.5 (~28.6 degrees)
+            smoothness: Smoothness factor (0-1). Higher values create smoother curves.
+                       0 = completely random, 1 = very smooth gradual bending.
+
+        Returns:
+            Random joint positions. Shape: (num_configs, num_joints)
+        """
+        if num_configs is None:
+            num_configs = self.num_envs
+
+        num_joints = self.robot.num_joints
+
+        # Generate base random values
+        joint_positions = torch.randn(num_configs, num_joints, device=self.device)
+
+        # Apply smoothing by correlating adjacent joints
+        if smoothness > 0:
+            # Apply exponential moving average across joints for smooth bending
+            smoothed = torch.zeros_like(joint_positions)
+            alpha = 1.0 - smoothness  # Convert to decay factor
+
+            for env_idx in range(num_configs):
+                smoothed[env_idx, 0] = joint_positions[env_idx, 0]
+                for joint_idx in range(1, num_joints):
+                    # Exponential moving average: smooth blend with previous joint
+                    smoothed[env_idx, joint_idx] = (
+                        alpha * joint_positions[env_idx, joint_idx] +
+                        (1 - alpha) * smoothed[env_idx, joint_idx - 1]
+                    )
+
+            joint_positions = smoothed
+
+        # Normalize and scale to desired range
+        # Clamp to reasonable values first
+        joint_positions = torch.clamp(joint_positions, -3.0, 3.0)
+
+        # Scale to max_angle range
+        joint_positions = joint_positions * (max_angle / 3.0)
+        print("initial_joint",joint_positions)
+
+        return joint_positions
+
+    def reset(self, env_ids: torch.Tensor = None, joint_positions: torch.Tensor = None) -> None:
+        """Reset robot to initial pose with specified joint positions.
+
+        Args:
+            env_ids: Environment indices to reset. If None, resets all environments.
+            joint_positions: Desired joint positions for reset. Shape: (len(env_ids), num_joints).
+                           If None, resets to zero joint positions (straight configuration).
+                           Can pass 'random' as a string to generate random configurations.
+                           Can pass a CSV filepath (str ending with '.csv') to load from saved state.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        # Check if we're loading from CSV (need to load root state too)
+        load_from_csv = isinstance(joint_positions, str) and joint_positions.endswith('.csv')
+
+        # Get default root state
+        root_state = self.robot.data.default_root_state[env_ids].clone()
+
+        # Set root position and orientation
+        if load_from_csv:
+            # Load complete state from CSV (root pose + joint positions)
+            # Pass env_ids so each environment gets its own data from CSV
+            root_pos_csv, root_quat_csv, joint_pos = self._load_state_from_csv(joint_positions, env_ids)
+            root_state[:, :3] = root_pos_csv
+            root_state[:, 3:7] = root_quat_csv
+        else:
+            # Use default position logic
+            if self.env_init_pos is not None and self.env_init_pos.shape[0] == len(env_ids):
+                root_state[:, :3] = self.env_init_pos
+            else:
+                origins = self.scene.env_origins[env_ids]
+                root_state[:, :3] = origins + self.init_pos
+
+            # Set orientation
+            root_state[:, 3:7] = self.init_rot.repeat(len(env_ids), 1)
+
+            # Handle joint positions for non-CSV cases
+            if joint_positions is None:
+                joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+            elif isinstance(joint_positions, str):
+                if joint_positions.lower() == 'random':
+                    # Generate random smooth configurations
+                    joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
+                else:
+                    raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
+            else:
+                # Validate shape
+                if joint_positions.shape != (len(env_ids), self.robot.num_joints):
+                    raise ValueError(
+                        f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
+                        f"({len(env_ids)}, {self.robot.num_joints})"
+                    )
+                joint_pos = joint_positions.to(self.device)
+
+        # Zero velocities
+        root_state[:, 7:] = 0.0
+
+        # Write state to simulation
+        self.robot.write_root_state_to_sim(root_state, env_ids)
+
+        joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+
+        # Write joint state to simulation first
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        # Do not overwrite per-body poses here. This robot's articulation root is
+        # `world_anchor`, so the manual FK path does not match the actual
+        # world_anchor -> prismatic -> passive chain and can erase the configured
+        # root orientation. Let the articulation state we just wrote define the reset.
+
+        # Mark as initialized after first reset
+        if not self._is_initialized:
+            self._is_initialized = True
+            logging.info("Robot initialization completed after first reset")
+
+    def _reset_link_states_directly(
+        self,
+        env_ids: torch.Tensor,
+        joint_positions: torch.Tensor,
+        root_state: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Directly set each link's state in simulation based on joint configuration.
+
+        This method computes each link's position and orientation using forward kinematics,
+        then directly writes these poses to the PhysX simulation, bypassing joint constraints.
+        This ensures links are immediately positioned correctly without waiting for physics settling.
+
+        Args:
+            env_ids: Environment indices to reset.
+            joint_positions: Joint positions for the configuration. Shape: (len(env_ids), num_joints).
+        """
+        from isaaclab.utils import math as math_utils
+
+        link_radius = self.config["robot_config"].get("link_radius", 0.01)
+        link_height = self.config["robot_config"].get("link_height", 0.05)
+
+        # Get the root state for calculating relative link positions.
+        # Use the provided root_state when available to avoid stale buffer reads.
+        if root_state is None:
+            root_state = self.robot.data.root_state_w[env_ids]
+        root_pos = root_state[:, :3]  # (len(env_ids), 3)
+        root_quat = root_state[:, 3:7]  # (len(env_ids), 4) - (w, x, y, z)
+
+        # Compute all link poses using forward kinematics
+        link_poses = self._compute_forward_kinematics(
+            root_pos, root_quat, joint_positions, link_height, link_radius
+        )
+
+        # Access the PhysX view to directly set body transforms
+        physx_view = self.robot.root_physx_view
+
+        # Convert env_ids to the format expected by PhysX
+        if isinstance(env_ids, torch.Tensor):
+            physx_env_ids = env_ids.cpu().numpy()
+        else:
+            physx_env_ids = env_ids
+
+        # Try to directly set link transforms in PhysX
+        # This bypasses the joint constraints and directly positions each body
+        try:
+            # Get all body transforms for the environments
+            # Shape: (num_envs, num_bodies, 7) where 7 = [pos(3), quat(4) in xyzw]
+            num_bodies = self.robot.num_bodies
+
+            # Convert quaternions from wxyz to xyzw for PhysX
+            link_poses_xyzw = link_poses.clone()
+            link_poses_xyzw[:, :, 3:] = math_utils.convert_quat(link_poses_xyzw[:, :, 3:], to="xyzw")
+
+            # Set body poses for all links at once
+            # Reshape to (num_envs * num_bodies, 7) for batch setting
+            all_poses = link_poses_xyzw.reshape(-1, 7)
+            all_velocities = torch.zeros((len(env_ids) * num_bodies, 6), device=self.device)
+
+            # Create body indices: [0, 1, 2, ..., num_bodies-1] repeated for each env
+            body_indices = torch.arange(num_bodies, device=self.device).repeat(len(env_ids))
+
+            # Create env indices: [env_0]*num_bodies + [env_1]*num_bodies + ...
+            env_indices_repeated = torch.repeat_interleave(
+                torch.tensor(physx_env_ids, device=self.device), num_bodies
+            ).cpu().numpy()
+
+            # Try the batch set method
+            if hasattr(physx_view, 'set_link_transforms'):
+                physx_view.set_link_transforms(
+                    all_poses,
+                    link_indices=body_indices.cpu().numpy(),
+                    indices=env_indices_repeated
+                )
+                physx_view.set_link_velocities(
+                    all_velocities,
+                    link_indices=body_indices.cpu().numpy(),
+                    indices=env_indices_repeated
+                )
+                logging.debug(f"Successfully set link transforms for {len(env_ids)} environments")
+            else:
+                # Fallback: Set each link individually
+                logging.debug("Using per-link transform setting (no batch API available)")
+                for link_idx in range(num_bodies):
+                    link_pose = link_poses_xyzw[:, link_idx, :]
+                    link_vel = torch.zeros((len(env_ids), 6), device=self.device)
+
+                    if hasattr(physx_view, 'set_body_transforms'):
+                        for i, env_id in enumerate(physx_env_ids):
+                            physx_view.set_body_transforms(
+                                link_pose[i:i+1],
+                                body_indices=[link_idx],
+                                indices=[env_id]
+                            )
+                            physx_view.set_body_velocities(
+                                link_vel[i:i+1],
+                                body_indices=[link_idx],
+                                indices=[env_id]
+                            )
+                    else:
+                        if link_idx == 0:
+                            logging.warning(
+                                "PhysX view doesn't support direct link transform setting. "
+                                "Relying on joint positions only. Links may take time to settle."
+                            )
+                        break
+
+        except (AttributeError, RuntimeError, TypeError) as e:
+            logging.debug(f"Could not directly set link states: {e}. Using joint-based positioning.")
+            # Not a critical error - joint positions will still work, just may need settling time
+
+    def _compute_forward_kinematics(
+        self,
+        root_pos: torch.Tensor,
+        root_quat: torch.Tensor,
+        joint_positions: torch.Tensor,
+        link_height: float,
+        link_radius: float,
+    ) -> torch.Tensor:
+        """Compute forward kinematics to get link poses from joint positions.
+
+        This computes the world position and orientation of each link based on the
+        kinematic chain and joint angles.
+
+        Args:
+            root_pos: Root link positions. Shape: (num_envs, 3)
+            root_quat: Root link orientations (w,x,y,z). Shape: (num_envs, 4)
+            joint_positions: Joint angles. Shape: (num_envs, num_joints)
+            link_height: Length of each link
+            link_radius: Radius of each link
+
+        Returns:
+            Link poses (position + quaternion) for all links. Shape: (num_envs, num_bodies, 7)
+        """
+        from isaaclab.utils import math as math_utils
+
+        num_envs = len(root_pos)
+        num_bodies = self.robot.num_bodies
+
+        # Initialize output: (num_envs, num_bodies, 7) where 7 = [pos(3), quat(4)]
+        link_poses = torch.zeros((num_envs, num_bodies, 7), device=self.device)
+
+        # Link 0 (passive_0) is the root - its pose is the root pose
+        link_poses[:, 0, :3] = root_pos
+        link_poses[:, 0, 3:7] = root_quat
+
+        # For subsequent links, compute pose based on previous link and joint angle
+        # Joint i connects link i-1 to link i
+        for link_idx in range(1, num_bodies):
+            joint_idx = link_idx - 1  # Joint index (joint_1 connects passive_0 to passive_1)
+
+            # Get previous link's pose
+            prev_pos = link_poses[:, link_idx - 1, :3]
+            prev_quat = link_poses[:, link_idx - 1, 3:7]
+
+            # Joint rotation axis alternates between Y and Z
+            # passive_1 (joint_idx=0) uses Z, passive_2 (joint_idx=1) uses Y, etc.
+            if joint_idx % 2 == 0:
+                axis = "Z"
+            else:
+                axis = "Y"
+
+            # Get joint angle for this joint
+            joint_angle = joint_positions[:, joint_idx]  # (num_envs,)
+
+            # Create rotation quaternion for the joint angle
+            if axis == "Z":
+                # Rotation around Z axis
+                axis_vec = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+            else:  # axis == "Y"
+                # Rotation around Y axis
+                axis_vec = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+
+            # Create quaternion from axis-angle
+            joint_quat = math_utils.quat_from_angle_axis(joint_angle, axis_vec.repeat(num_envs, 1))
+
+            # Local offset from previous link center to joint (at -X end of previous link)
+            local_offset_to_joint = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_joint[:, 0] = -link_height / 2  # Joint at -X end
+
+            # Transform to world frame
+            world_offset_to_joint = quat_apply(prev_quat, local_offset_to_joint)
+            joint_pos = prev_pos + world_offset_to_joint
+
+            # Current link orientation = previous orientation * joint rotation
+            current_quat = math_utils.quat_mul(prev_quat, joint_quat)
+
+            # Local offset from joint to current link center (at +X end of current link in local frame)
+            local_offset_to_center = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_center[:, 0] = link_height / 2  # Link center at +X/2 from joint
+
+            # Transform to world frame using current orientation
+            world_offset_to_center = quat_apply(current_quat, local_offset_to_center)
+            current_pos = joint_pos + world_offset_to_center
+
+            # Store link pose
+            link_poses[:, link_idx, :3] = current_pos
+            link_poses[:, link_idx, 3:7] = current_quat
+
+        return link_poses
